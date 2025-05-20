@@ -191,6 +191,34 @@ def git_clone(url, dir, name, commithash=None):
 re_requirement = re.compile(r"\s*([-_a-zA-Z0-9]+)\s*(?:==\s*([-+_.a-zA-Z0-9]+))?\s*")
 
 
+def get_latest_commit_hash(repo_url, branch_name):
+    try:
+        cmd = ['git', 'ls-remote', repo_url, f'refs/heads/{branch_name}']
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            check=True,
+            encoding='utf-8'
+        )
+        if result.stdout:
+            commit_hash = result.stdout.split()[0]
+            return commit_hash
+        else:
+            print(f"Warning: No output from 'git ls-remote' for branch '{branch_name}' on '{repo_url}'.")
+            return None
+    except subprocess.CalledProcessError as e:
+        print(f"Error getting latest commit hash for branch '{branch_name}' on '{repo_url}': {e}")
+        if e.stderr:
+            print(f"Stderr: {e.stderr.strip()}")
+        return None
+    except FileNotFoundError:
+        print("Error: 'git' command not found. Please ensure Git is installed and in your PATH.")
+        return None
+    except IndexError:
+        print(f"Error: Could not parse commit hash from 'git ls-remote' output for branch '{branch_name}'.")
+        return None
+        
 def prepare_environment():
     tt_repo = "https://github.com/hako-mikan/sd-webui-traintrain.git"
     tt_branch = args.branch
@@ -198,54 +226,43 @@ def prepare_environment():
     torch_command = os.environ.get('TORCH_COMMAND', f"pip install torch==2.3.1 torchvision==0.18.1 --extra-index-url {torch_index_url}")
     if args.use_ipex:
         if platform.system() == "Windows":
-            # The "Nuullll/intel-extension-for-pytorch" wheels were built from IPEX source for Intel Arc GPU: https://github.com/intel/intel-extension-for-pytorch/tree/xpu-main
-            # This is NOT an Intel official release so please use it at your own risk!!
-            # See https://github.com/Nuullll/intel-extension-for-pytorch/releases/tag/v2.0.110%2Bxpu-master%2Bdll-bundle for details.
-            #
-            # Strengths (over official IPEX 2.0.110 windows release):
-            #   - AOT build (for Arc GPU only) to eliminate JIT compilation overhead: https://github.com/intel/intel-extension-for-pytorch/issues/399
-            #   - Bundles minimal oneAPI 2023.2 dependencies into the python wheels, so users don't need to install oneAPI for the whole system.
-            #   - Provides a compatible torchvision wheel: https://github.com/intel/intel-extension-for-pytorch/issues/465
-            # Limitation:
-            #   - Only works for python 3.10
             url_prefix = "https://github.com/Nuullll/intel-extension-for-pytorch/releases/download/v2.0.110%2Bxpu-master%2Bdll-bundle"
             torch_command = os.environ.get('TORCH_COMMAND', f"pip install {url_prefix}/torch-2.0.0a0+gite9ebda2-cp310-cp310-win_amd64.whl {url_prefix}/torchvision-0.15.2a0+fa99a53-cp310-cp310-win_amd64.whl {url_prefix}/intel_extension_for_pytorch-2.0.110+gitc6ea20b-cp310-cp310-win_amd64.whl")
         else:
-            # Using official IPEX release for linux since it's already an AOT build.
-            # However, users still have to install oneAPI toolkit and activate oneAPI environment manually.
-            # See https://intel.github.io/intel-extension-for-pytorch/index.html#installation for details.
             torch_index_url = os.environ.get('TORCH_INDEX_URL', "https://pytorch-extension.intel.com/release-whl/stable/xpu/us/")
             torch_command = os.environ.get('TORCH_COMMAND', f"pip install torch==2.0.0a0 intel-extension-for-pytorch==2.0.110+gitba7f6c1 --extra-index-url {torch_index_url}")
-    requirements_file = os.environ.get('REQS_FILE', "requirements_versions.txt")
+    requirements_file_name = os.environ.get('REQS_FILE', "requirements_versions.txt")
 
     xformers_package = os.environ.get('XFORMERS_PACKAGE', 'xformers==0.0.27')
     clip_package = os.environ.get('CLIP_PACKAGE', "https://github.com/openai/CLIP/archive/d50d76daa670286dd6cacf3bcd80b5e4823fc8e1.zip")
     openclip_package = os.environ.get('OPENCLIP_PACKAGE', "https://github.com/mlfoundations/open_clip/archive/bb6e834e9c70d9c27d0dc3ecedeebeaeb1ffad6b.zip")
 
     try:
-        # the existence of this file is a signal to webui.sh/bat that webui needs to be restarted when it stops execution
-        os.remove(os.path.join(script_path, "tmp", "restart"))
+        restart_file_path = os.path.join(script_path, "tmp", "restart")
+        if os.path.exists(restart_file_path):
+            os.remove(restart_file_path)
         os.environ.setdefault('SD_WEBUI_RESTARTING', '1')
-    except OSError:
+    except OSError as e:
+        print(f"Info: Could not remove restart signal file: {e}")
         pass
 
     if not args.skip_python_version_check:
         check_python_version()
 
     print(f"Python {sys.version}")
+    python_executable = sys.executable
     if args.reinstall_torch or not is_installed("torch") or not is_installed("torchvision"):
-        run(f'"{python}" -m {torch_command}', "Installing torch and torchvision", "Couldn't install torch", live=True)
+        run(f'"{python_executable}" -m {torch_command}', "Installing torch and torchvision", "Couldn't install torch", live=True)
 
     if args.use_ipex:
         args.skip_torch_cuda_test = True
         
-    if not args.skip_torch_cuda_test and not check_run_python("import torch; assert torch.cuda.is_available()"):
-        raise RuntimeError(
-            'Your device does not support the current version of Torch/CUDA! Consider download another version: \n'
-            'https://github.com/lllyasviel/stable-diffusion-webui-forge/releases/tag/latest'
-            # 'Torch is not able to use GPU; '
-            # 'add --skip-torch-cuda-test to COMMANDLINE_ARGS variable to disable this check'
-        )
+    if not args.skip_torch_cuda_test:
+        if not check_run_python("import torch; assert torch.cuda.is_available()"):
+            raise RuntimeError(
+                'Your device does not support the current version of Torch/CUDA! Consider download another version: \n'
+                'https://github.com/lllyasviel/stable-diffusion-webui-forge/releases/tag/latest'
+            )
         
     if not is_installed("clip"):
         run_pip(f"install {clip_package}", "clip")
@@ -259,14 +276,53 @@ def prepare_environment():
     if not is_installed("ngrok") and args.ngrok:
         run_pip("install ngrok", "ngrok")
         
-    git_clone(tt_repo, os.path.join(script_path, "traintrain"), "traintrain", tt_branch, pull=True)
+    traintrain_local_dir = os.path.join(script_path, "traintrain")
+    
+    print(f"Preparing 'traintrain' repository ({tt_repo}) on branch '{tt_branch}'...")
+    latest_commit_hash = get_latest_commit_hash(tt_repo, tt_branch)
+
+    if latest_commit_hash:
+        print(f"Target commit for 'traintrain' (branch: {tt_branch}): {latest_commit_hash}")
+        git_clone(
+            tt_repo,
+            traintrain_local_dir,
+            "traintrain",
+            commithash=latest_commit_hash
+        )
+    else:
+        print(f"Warning: Could not determine the latest commit for branch '{tt_branch}' of 'traintrain'.")
+        print(f"Attempting to clone 'traintrain' (default branch) or use existing if present, without forcing a specific commit.")
+        git_clone(
+            tt_repo,
+            traintrain_local_dir,
+            "traintrain"
+        )
+
     if not args.disable_update:
-        git_pull("traintrain")
+        if os.path.exists(os.path.join(traintrain_local_dir, ".git")):
+            print(f"Ensuring 'traintrain' is on branch '{tt_branch}' and pulling updates...")
+            try:
+                run_git(traintrain_local_dir, "traintrain", f"checkout {tt_branch}",
+                        f"Attempting to checkout branch '{tt_branch}' for 'traintrain'...",
+                        f"Couldn't checkout branch '{tt_branch}' for 'traintrain'. It might not exist locally yet, or other Git error.",
+                        live=True)
 
-    if not os.path.isfile(requirements_file):
-        requirements_file = os.path.join(script_path, requirements_file)
+                git_pull("traintrain")
+            except Exception as e:
+                print(f"Warning: Failed to ensure branch '{tt_branch}' or pull updates for 'traintrain': {e}")
+        else:
+            print(f"Info: Skipping pull for 'traintrain' as the repository does not exist at {traintrain_local_dir}.")
 
-    run_pip(f"install -r \"{requirements_file}\"", "requirements")
+
+    final_requirements_file = requirements_file_name
+    if not os.path.isfile(final_requirements_file):
+        final_requirements_file = os.path.join(script_path, requirements_file_name)
+
+    if os.path.isfile(final_requirements_file):
+        print(f"Installing requirements from {final_requirements_file}...")
+        run_pip(f"install -r \"{final_requirements_file}\"", "requirements")
+    else:
+        print(f"Warning: Requirements file not found: {final_requirements_file}. Skipping installation of requirements.")
 
 def start():
     print(f"Launching {'API server' if '--nowebui' in sys.argv else 'Web UI'} with arguments: {shlex.join(sys.argv[1:])}")

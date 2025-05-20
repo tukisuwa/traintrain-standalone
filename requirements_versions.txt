@@ -1,4 +1,4 @@
-gradio==5.20.1
+gradio==5.30.0
 torch
 tqdm==4.66.1
 safetensors==0.4.2
